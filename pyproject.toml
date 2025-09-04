@@ -1,5 +1,5 @@
 [project]
-name = "rag-research-chatbot"
+name = "u_ok_luv"
 version = "1.0.0"
 description = "A Retrieval-Augmented Generation GPT model using OpenAI's API for women's health research."
 authors = [
@@ -8,6 +8,10 @@ authors = [
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 dependencies = [
     "requests>=2.31.0",
