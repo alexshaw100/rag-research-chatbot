@@ -1,0 +1,27 @@
+[project]
+name = "rag-research-chatbot"
+version = "1.0.0"
+description = "A Retrieval-Augmented Generation GPT model using OpenAI's API for women's health research."
+authors = [
+    { name = "Alex Shaw", email = "alshaw1026@gmail.com" }
+]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "numpy",
+    "openai",
+    "tqdm",
+    "requests",
+    "faiss-cpu",
+    "python-dotenv"
+]
