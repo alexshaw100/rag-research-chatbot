@@ -29,3 +29,6 @@ dev-dependencies = [
     "faiss-cpu",
     "python-dotenv"
 ]
+
+[project.scripts]
+download-papers = "u_ok_luv.vec_db_refresh.download_papers:download_papers"

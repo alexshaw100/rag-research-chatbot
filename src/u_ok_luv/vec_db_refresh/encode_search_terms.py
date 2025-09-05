@@ -26,6 +26,13 @@ def decode_search_terms(csv: str):
     c.to_csv(csv, index=False)
     return c['Term']
 
+def read_search_terms(csv: str):
+    """
+    Decodes the items in a single column csv using base64 without editing the file.
+    """
+    c = pd.read_csv(csv)
+    return c['Term'].map(lambda t: base64.b64decode(t.encode('utf8')).decode('utf8'))
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--path', help='The path to the csv file with the terms to be encoded or decoded.')
