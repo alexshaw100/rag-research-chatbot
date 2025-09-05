@@ -29,6 +29,10 @@ def decode_search_terms(csv: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--path', help='The path to the csv file with the terms to be encoded or decoded.')
+    parser.add_argument('--decode', action="store_true", default=False, help='Will decode the file if provided.')
     args = parser.parse_args()
 
-    print(encode_search_terms(args.path))
+    if args.decode:
+        print(decode_search_terms(args.path))
+    else:
+        print(encode_search_terms(args.path))
