@@ -123,78 +123,27 @@ def query_medrxiv_papers(terms: list[str],
         A list of dicts with keys roughly: paper_id, title, authors, published,
         chunk_id, text_chunk, abstract (or summary), doi, etc.
     """
-    # Build the term filtering (simple OR across terms)
-    # lower-case matching, naive
-    lower_terms = [t.lower() for t in terms]
-
-    # Compute date interval (YYYY-MM-DD/YYYY-MM-DD per API docs)
-    end_date = now_utc = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=days_back)
-    interval = f"{start_date:%Y-%m-%d}/{end_date:%Y-%m-%d}"
+    # Prepare filters and date window (YYYY-MM-DD/YYYY-MM-DD per API docs)
+    interval = _build_interval(days_back)
 
     collected = []
     cursor = 0
 
     while True:
-        # Fetch metadata for this page via BioRxiv API host
-        url = f"{base_url}/details/{server}/{interval}/{cursor}/json"
-        headers = {"Accept": "application/json"}
-        if user_agent:
-            headers["User-Agent"] = user_agent
-
-        attempt = 0
-        while True:
-            http = session or requests
-            resp = http.get(url, headers=headers, timeout=timeout_seconds)
-            if resp.status_code == STATUS_OK:
-                break
-            attempt += 1
-            if resp.status_code in (403, 429, 502, 503, 504) and attempt <= retries:
-                sleep_for = backoff_seconds * attempt
-                print(f"medRxiv API status {resp.status_code}; retrying in {sleep_for:.1f}s (attempt {attempt}/{retries})...")
-                time.sleep(sleep_for)
-                continue
-            print(f"medRxiv API request failed with status {resp.status_code}, url {url}")
+        url = _build_medrxiv_url(base_url, server, interval, cursor)
+        headers = _build_headers(user_agent)
+        data = _request_json(session, url, headers, timeout_seconds, retries, backoff_seconds)
+        if data is None:
             return collected
 
-        data = resp.json()
-
-        # The "collection" of preprint metadata is usually in something like data['collection']
-        # Check the keys: depending on API schema
         items = data.get("collection", [])
         if not items:
             break
 
         for item in items:
-            # basic metadata
-            abstract = item.get("abstract", "") or ""
-            title = item.get("title", "") or ""
-            # Normalize authors string to a consistent comma-separated list
-            authors_raw = item.get("authors", "") or ""
-            authors_list = [a.strip() for a in authors_raw.split(";") if a.strip()]
-            authors = ", ".join(authors_list)
-            doi = item.get("doi", "") or ""
-            date_str = item.get("date", "") or ""
-            published = _safe_date_iso(date_str)
-
-            # check if any search term appears in title OR abstract
-            ta_lower = (title + " " + abstract).lower()
-            if not any(term in ta_lower for term in lower_terms):
-                continue
-
-            # now chunk the abstract or summary
-            wrapped = textwrap.wrap(abstract.strip().replace("\n", " "), width=wrap_width)
-            for i, chunk in enumerate(wrapped):
-                collected.append({
-                    "paper_id": doi or item.get("server", "") + "_" + item.get("version", ""),
-                    "title": title,
-                    "authors": authors,
-                    "published": published,
-                    "chunk_id": i,
-                    "text_chunk": chunk,
-                    "abstract": abstract,
-                    "doi": doi
-                })
+            rows = _process_medrxiv_item(item, terms, wrap_width)
+            for row in rows:
+                collected.append(row)
                 if len(collected) >= max_results:
                     break
             if len(collected) >= max_results:
@@ -202,14 +151,86 @@ def query_medrxiv_papers(terms: list[str],
 
         # check if we need to paginate further
         cursor += len(items)
-        # if we got fewer than the page size, likely no more data
-        if len(items) < page_size:
-            break
-        # if we've reached max_results, stop
-        if len(collected) >= max_results:
+        collected_len, len_items = len(collected), len(items)
+        if collected_len >= max_results or len_items < page_size:
             break
 
     return collected
+
+
+def _build_interval(days_back: int) -> str:
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=days_back)
+    return f"{start_date:%Y-%m-%d}/{end_date:%Y-%m-%d}"
+
+
+def _build_medrxiv_url(base_url: str, server: str, interval: str, cursor: int) -> str:
+    return f"{base_url}/details/{server}/{interval}/{cursor}/json"
+
+
+def _build_headers(user_agent: str | None) -> dict:
+    headers = {"Accept": "application/json"}
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    return headers
+
+
+def _request_json(
+    session: requests.Session | None,
+    url: str,
+    headers: dict,
+    timeout_seconds: float,
+    retries: int,
+    backoff_seconds: float,
+) -> dict | None:
+    attempt = 0
+    http = session or requests
+    while True:
+        resp = http.get(url, headers=headers, timeout=timeout_seconds)
+        if resp.status_code == STATUS_OK:
+            try:
+                return resp.json()
+            except Exception:
+                print(f"Failed to decode JSON from {url}")
+                return None
+        attempt += 1
+        if resp.status_code in (403, 429, 502, 503, 504) and attempt <= retries:
+            sleep_for = backoff_seconds * attempt
+            print(f"medRxiv API status {resp.status_code}; retrying in {sleep_for:.1f}s (attempt {attempt}/{retries})...")
+            time.sleep(sleep_for)
+            continue
+        print(f"medRxiv API request failed with status {resp.status_code}, url {url}")
+        return None
+
+
+def _process_medrxiv_item(item: dict, lower_terms: list[str], wrap_width: int) -> list[dict]:
+    abstract = (item.get("abstract") or "").strip()
+    title = (item.get("title") or "").strip()
+    authors_raw = (item.get("authors") or "").strip()
+    authors_list = [a.strip() for a in authors_raw.split(";") if a.strip()]
+    authors = ", ".join(authors_list)
+    doi = item.get("doi", "") or ""
+    date_str = item.get("date", "") or ""
+    published = _safe_date_iso(date_str)
+
+    ta_lower = (title + " " + abstract).lower()
+    if lower_terms and not any(term in ta_lower for term in lower_terms):
+        return []
+
+    wrapped = textwrap.wrap(abstract.replace("\n", " "), width=wrap_width)
+    rows: list[dict] = []
+    for i, chunk in enumerate(wrapped):
+        rows.append({
+            "paper_id": doi or f"{item.get('server', '')}_{item.get('version', '')}",
+            "title": title,
+            "authors": authors,
+            "published": published,
+            "chunk_id": i,
+            "text_chunk": chunk,
+            "abstract": abstract,
+            "doi": doi,
+        })
+    return rows
 
 
 def _safe_date_iso(date_str: str) -> str:

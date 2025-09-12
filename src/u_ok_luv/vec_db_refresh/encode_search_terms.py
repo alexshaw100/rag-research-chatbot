@@ -28,10 +28,11 @@ def decode_search_terms(csv: str):
 
 def read_search_terms(csv: str):
     """
-    Decodes the items in a single column csv using base64 without editing the file.
+    Decodes the items in a single column csv using base64 without editing the stored encoded terms.
+    Converts terms to all lowercase.
     """
     c = pd.read_csv(csv)
-    return c['Term'].map(lambda t: base64.b64decode(t.encode('utf8')).decode('utf8'))
+    return c['Term'].map(lambda t: base64.b64decode(t.encode('utf8')).decode('utf8').lower())
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
