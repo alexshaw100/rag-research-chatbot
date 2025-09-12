@@ -67,7 +67,7 @@ def save_collected_data(data: list[dict], csv_path: str):
         for row in data:
             # Ensure missing keys are written as empty strings and sanitize values
             writer.writerow({k: _normalize_cell(row.get(k, "")) for k in fieldnames})
-    print(f"Saved {len(data)} text chunks from arXiv/medRxiv papers to '{csv_path}'")
+    print(f"Saved {len(data)} text chunks from papers to '{csv_path}'")
 
 
 def query_arxiv_papers(terms: list[str], max_results: int = 500, wrap_width: int = 500):
@@ -127,7 +127,8 @@ def query_medrxiv_papers(terms: list[str],
         chunk_id, text_chunk, abstract (or summary), doi, etc.
     """
     # Prepare filters and date window (YYYY-MM-DD/YYYY-MM-DD per API docs)
-    interval = _build_interval(days_back)
+    start, end = _interval_dates(days_back)
+    interval = f"{start}/{end}"
 
     collected = []
     cursor = 0
@@ -161,10 +162,11 @@ def query_medrxiv_papers(terms: list[str],
     return collected
 
 
-def _build_interval(days_back: int) -> str:
+def _interval_dates(days_back: int) -> tuple[str, str]:
+    # Use the non-deprecated datetime date query
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
-    return f"{start_date:%Y-%m-%d}/{end_date:%Y-%m-%d}"
+    return f"{start_date:%Y-%m-%d}", f"{end_date:%Y-%m-%d}"
 
 
 def _build_medrxiv_url(base_url: str, server: str, interval: str, cursor: int) -> str:
@@ -280,12 +282,110 @@ def dedupe_rows(rows: list[dict]) -> list[dict]:
         out.append(r)
     return out
 
+def query_europe_pmc_papers(
+    terms: list[str],
+    days_back: int = 7,
+    max_results: int = 500,
+    page_size: int = 100,
+    base_url: str = "https://www.ebi.ac.uk/europepmc/webservices/rest",
+    timeout_seconds: float = 15.0,
+    wrap_width: int = 500,
+    session: requests.Session | None = None,
+):
+    """
+    Query Europe PMC for recent articles/preprints matching any search term.
+    Filters by FIRST_PDATE within the last `days_back` days and requires abstracts.
+    """
+    collected: list[dict] = []
+    if not terms:
+        return collected
+
+    start_date, end_date = _interval_dates(days_back)
+    # Build a Lucene query: (term1 OR term2 ...) AND FIRST_PDATE:[start TO end] AND HAS_ABSTRACT:Y
+    terms_or = " OR ".join([f'"{t}"' for t in terms])
+    date_filter = f"FIRST_PDATE:[{start_date} TO {end_date}]"
+    query = f"({terms_or}) AND {date_filter} AND HAS_ABSTRACT:Y"
+
+    http = session or requests
+    cursor = "*"
+
+    while True:
+        params = {
+            "query": query,
+            "format": "json",
+            "pageSize": str(page_size),
+            "cursorMark": cursor,
+        }
+        url = f"{base_url}/search"
+        try:
+            resp = http.get(url, params=params, timeout=timeout_seconds)
+        except Exception as e:
+            print(f"Europe PMC request error: {e}")
+            break
+        if resp.status_code != STATUS_OK:
+            print(f"Europe PMC API request failed with status {resp.status_code}, url {resp.url}")
+            break
+        try:
+            data = resp.json()
+        except Exception:
+            print("Europe PMC: failed to decode JSON")
+            break
+
+        results = (data.get("resultList") or {}).get("result", [])
+        if not results:
+            break
+
+        for item in results:
+            abstract = (item.get("abstractText") or "").strip()
+            title = (item.get("title") or "").strip()
+            if not abstract:
+                continue
+            authors = (item.get("authorString") or "").strip()
+            doi = (item.get("doi") or "").strip()
+            published = _safe_date_iso(item.get("firstPublicationDate") or item.get("pubYear") or "")
+            # Build a stable paper_id combining internal id + source (e.g., MED, PMC, AGR)
+            internal_id = (item.get("id") or "").strip()
+            src_code = (item.get("source") or "").strip()
+            paper_id = f"EPMC:{src_code}:{internal_id}" if internal_id or src_code else (doi or "")
+
+            wrapped = textwrap.wrap(abstract.replace("\n", " "), width=wrap_width)
+            for i, chunk in enumerate(wrapped):
+                collected.append({
+                    "paper_id": paper_id,
+                    "title": title,
+                    "authors": authors,
+                    "published": published,
+                    "source": "europe_pmc",
+                    "chunk_id": i,
+                    "text_chunk": chunk,
+                    "abstract": abstract,
+                    "doi": doi,
+                })
+                if len(collected) >= max_results:
+                    break
+            if len(collected) >= max_results:
+                break
+
+        if len(collected) >= max_results:
+            break
+
+        next_cursor = data.get("nextCursorMark")
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    return collected
+
 def download_papers():
     parser = argparse.ArgumentParser()
     parser.add_argument('--terms-dir', default=PACKAGE, help="Import path to the package containing base64-encoded search term .txt files.")
     parser.add_argument('--save-folder', default="ai_womens_health_paper_chunks/", help="Output folder for combined paper chunks (source-agnostic).")
     parser.add_argument('--max-results', type=int, default=500, help='Maximum number of chunks to collect per source.')
     parser.add_argument('--wrap-width', type=int, default=500, help='Character width for chunk wrapping of abstracts/summaries.')
+    # Source toggles (default: all enabled)
+    parser.add_argument('--no-arxiv', dest='use_arxiv', action='store_false', help='Enable querying arXiv (default).')
+    parser.add_argument('--no-medrxiv', dest='use_medrxiv', action='store_false', help='Enable querying medRxiv (default).')
+    parser.add_argument('--no-epmc', dest='use_epmc', action='store_false', help='Disable querying Europe PMC.')
     # medRxiv-specific controls
     parser.add_argument('--medrxiv-server', default="medrxiv", help='Preprint server for medRxiv API (e.g., "medrxiv", "biorxiv").')
     parser.add_argument('--medrxiv-days-back', type=int, default=7, help='Number of past days to query from medRxiv API.')
@@ -294,6 +394,10 @@ def download_papers():
     parser.add_argument('--medrxiv-retries', type=int, default=3, help='Retries for transient HTTP errors (403/429/5xx).')
     parser.add_argument('--medrxiv-backoff-seconds', type=float, default=1.5, help='Base backoff seconds between retries.')
     parser.add_argument('--medrxiv-timeout-seconds', type=float, default=15.0, help='Timeout for medRxiv HTTP requests.')
+    # Europe PMC controls
+    parser.add_argument('--epmc-base-url', default='https://www.ebi.ac.uk/europepmc/webservices/rest', help='Base URL for the Europe PMC REST API.')
+    parser.add_argument('--epmc-page-size', type=int, default=100, help='Page size for Europe PMC search.')
+    parser.add_argument('--epmc-timeout-seconds', type=float, default=15.0, help='Timeout for Europe PMC HTTP requests.')
     args = parser.parse_args()
 
     dir = (Path(os.getcwd()) / args.save_folder)
@@ -307,7 +411,7 @@ def download_papers():
     for doc, terms in all_terms.items():
         save_file_name = dir / f"{doc}.{SAVE_EXT}"
         try:
-            arxiv_data = query_arxiv_papers(terms, max_results=args.max_results, wrap_width=args.wrap_width)
+            arxiv_data = query_arxiv_papers(terms, max_results=args.max_results, wrap_width=args.wrap_width) if args.use_arxiv else []
             medrxiv_data = query_medrxiv_papers(
                 terms,
                 server=args.medrxiv_server,
@@ -320,8 +424,18 @@ def download_papers():
                 timeout_seconds=args.medrxiv_timeout_seconds,
                 wrap_width=args.wrap_width,
                 session=session,
-            )
-            combined = dedupe_rows((arxiv_data or []) + (medrxiv_data or []))
+            ) if args.use_medrxiv else []
+            epmc_data = query_europe_pmc_papers(
+                terms,
+                days_back=args.medrxiv_days_back,
+                max_results=args.max_results,
+                page_size=args.epmc_page_size,
+                base_url=args.epmc_base_url,
+                timeout_seconds=args.epmc_timeout_seconds,
+                wrap_width=args.wrap_width,
+                session=session,
+            ) if args.use_epmc else []
+            combined = dedupe_rows((arxiv_data or []) + (medrxiv_data or []) + (epmc_data or []))
             save_collected_data(combined, save_file_name)
         except arxiv.UnexpectedEmptyPageError:
             print(f"Page unexpectedly empty error for topic: {doc}.")
