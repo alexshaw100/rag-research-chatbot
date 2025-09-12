@@ -300,67 +300,22 @@ def query_europe_pmc_papers(
     if not terms:
         return collected
 
-    start_date, end_date = _interval_dates(days_back)
-    # Build a Lucene query: (term1 OR term2 ...) AND FIRST_PDATE:[start TO end] AND HAS_ABSTRACT:Y
-    terms_or = " OR ".join([f'"{t}"' for t in terms])
-    date_filter = f"FIRST_PDATE:[{start_date} TO {end_date}]"
-    query = f"({terms_or}) AND {date_filter} AND HAS_ABSTRACT:Y"
-
     http = session or requests
+    query = _epmc_build_query(terms, days_back)
     cursor = "*"
 
     while True:
-        params = {
-            "query": query,
-            "format": "json",
-            "pageSize": str(page_size),
-            "cursorMark": cursor,
-        }
-        url = f"{base_url}/search"
-        try:
-            resp = http.get(url, params=params, timeout=timeout_seconds)
-        except Exception as e:
-            print(f"Europe PMC request error: {e}")
+        page = _epmc_fetch_page(http, base_url, query, cursor, page_size, timeout_seconds)
+        if page is None:
             break
-        if resp.status_code != STATUS_OK:
-            print(f"Europe PMC API request failed with status {resp.status_code}, url {resp.url}")
-            break
-        try:
-            data = resp.json()
-        except Exception:
-            print("Europe PMC: failed to decode JSON")
-            break
-
-        results = (data.get("resultList") or {}).get("result", [])
+        results, next_cursor = page
         if not results:
             break
 
         for item in results:
-            abstract = (item.get("abstractText") or "").strip()
-            title = (item.get("title") or "").strip()
-            if not abstract:
-                continue
-            authors = (item.get("authorString") or "").strip()
-            doi = (item.get("doi") or "").strip()
-            published = _safe_date_iso(item.get("firstPublicationDate") or item.get("pubYear") or "")
-            # Build a stable paper_id combining internal id + source (e.g., MED, PMC, AGR)
-            internal_id = (item.get("id") or "").strip()
-            src_code = (item.get("source") or "").strip()
-            paper_id = f"EPMC:{src_code}:{internal_id}" if internal_id or src_code else (doi or "")
-
-            wrapped = textwrap.wrap(abstract.replace("\n", " "), width=wrap_width)
-            for i, chunk in enumerate(wrapped):
-                collected.append({
-                    "paper_id": paper_id,
-                    "title": title,
-                    "authors": authors,
-                    "published": published,
-                    "source": "europe_pmc",
-                    "chunk_id": i,
-                    "text_chunk": chunk,
-                    "abstract": abstract,
-                    "doi": doi,
-                })
+            rows = _epmc_process_item(item, http, base_url, timeout_seconds, wrap_width)
+            for r in rows:
+                collected.append(r)
                 if len(collected) >= max_results:
                     break
             if len(collected) >= max_results:
@@ -368,13 +323,141 @@ def query_europe_pmc_papers(
 
         if len(collected) >= max_results:
             break
-
-        next_cursor = data.get("nextCursorMark")
         if not next_cursor or next_cursor == cursor:
             break
         cursor = next_cursor
 
     return collected
+
+
+def _epmc_build_query(terms: list[str], days_back: int) -> str:
+    start_date, end_date = _interval_dates(days_back)
+    terms_or = " OR ".join([f'"{t}"' for t in terms])
+    date_filter = f"FIRST_PDATE:[{start_date} TO {end_date}]"
+    return f"({terms_or}) AND {date_filter} AND HAS_ABSTRACT:Y"
+
+
+def _epmc_fetch_page(
+    http,
+    base_url: str,
+    query: str,
+    cursor: str,
+    page_size: int,
+    timeout_seconds: float,
+) -> tuple[list[dict], str] | None:
+    params = {
+        "query": query,
+        "format": "json",
+        "pageSize": str(page_size),
+        "cursorMark": cursor,
+        "resultType": "core",
+    }
+    url = f"{base_url}/search"
+    try:
+        resp = http.get(url, params=params, timeout=timeout_seconds)
+    except Exception as e:
+        print(f"Europe PMC request error: {e}")
+        return None
+    if resp.status_code != STATUS_OK:
+        print(f"Europe PMC API request failed with status {resp.status_code}, url {resp.url}")
+        return None
+    try:
+        data = resp.json()
+    except Exception:
+        print("Europe PMC: failed to decode JSON")
+        return None
+    results = (data.get("resultList") or {}).get("result", [])
+    next_cursor = data.get("nextCursorMark")
+    return results, next_cursor
+
+
+def _epmc_process_item(
+    item: dict,
+    http,
+    base_url: str,
+    timeout_seconds: float,
+    wrap_width: int,
+) -> list[dict]:
+    abstract = (item.get("abstractText") or "").strip()
+    title = (item.get("title") or "").strip()
+    if not abstract:
+        detail = _epmc_fetch_detail(http, base_url, item.get("source"), item.get("id"), timeout_seconds)
+        if detail:
+            abstract = (detail.get("abstractText") or "").strip()
+    if not abstract and (item.get("source") == "PMC" or (item.get("inPMC") or "N") == "Y" or item.get("pmcid")):
+        fulltext = _epmc_fetch_fulltext(http, base_url, item.get("source"), item.get("id"), timeout_seconds)
+        if fulltext:
+            abstract = fulltext[:2000]
+
+    if not abstract:
+        return []
+
+    authors = (item.get("authorString") or "").strip()
+    doi = (item.get("doi") or "").strip()
+    published = _safe_date_iso(item.get("firstPublicationDate") or item.get("pubYear") or "")
+    internal_id = (item.get("id") or "").strip()
+    src_code = (item.get("source") or "").strip()
+    paper_id = f"EPMC:{src_code}:{internal_id}" if internal_id or src_code else (doi or "")
+
+    wrapped = textwrap.wrap(abstract.replace("\n", " "), width=wrap_width)
+    rows: list[dict] = []
+    for i, chunk in enumerate(wrapped):
+        rows.append({
+            "paper_id": paper_id,
+            "title": title,
+            "authors": authors,
+            "published": published,
+            "source": "europe_pmc",
+            "chunk_id": i,
+            "text_chunk": chunk,
+            "abstract": abstract,
+            "doi": doi,
+        })
+    return rows
+
+
+def _epmc_fetch_detail(http, base_url: str, source: str | None, ext_id: str | None, timeout_seconds: float) -> dict | None:
+    if not source or not ext_id:
+        return None
+    url = f"{base_url}/{source}/{ext_id}"
+    try:
+        resp = http.get(url, params={"format": "json", "resultType": "core"}, timeout=timeout_seconds)
+    except Exception:
+        return None
+    if resp.status_code != STATUS_OK:
+        return None
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    return data.get("result") or None
+
+
+def _epmc_fetch_fulltext(http, base_url: str, source: str | None, ext_id: str | None, timeout_seconds: float) -> str | None:
+    if source != "PMC" or not ext_id:
+        return None
+    url = f"{base_url}/{source}/{ext_id}/fullTextXML"
+    try:
+        resp = http.get(url, timeout=timeout_seconds)
+    except Exception:
+        return None
+    if resp.status_code != STATUS_OK:
+        return None
+    xml_text = resp.text
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_text)
+        # Extract text from abstract and body paragraphs
+        parts: list[str] = []
+        for tag in ["abstract", "body"]:
+            for elem in root.iter(tag):
+                for p in elem.iter("p"):
+                    text = "".join(p.itertext()).strip()
+                    if text:
+                        parts.append(text)
+        return "\n\n".join(parts)
+    except Exception:
+        return None
 
 def download_papers():
     parser = argparse.ArgumentParser()
@@ -441,7 +524,6 @@ def download_papers():
             print(f"Page unexpectedly empty error for topic: {doc}.")
         except Exception as e:
             print(f"Error downloading papers for topic '{doc}': {e}")
-    
 
 if __name__ == "__main__":
     download_papers()
