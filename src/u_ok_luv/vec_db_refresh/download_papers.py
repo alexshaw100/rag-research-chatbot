@@ -1,21 +1,24 @@
 import argparse
 import arxiv
 import csv
-import importlib.resources as resources
+import os
 import textwrap
+import requests
+import importlib.resources as resources
+from pathlib import Path
 
 from u_ok_luv.vec_db_refresh.encode_search_terms import read_search_terms
 
 PACKAGE = "u_ok_luv.vec_db_refresh.search_terms"
+SAVE_EXT = "csv"
 
 
-def load_all_search_terms(package: str = PACKAGE):
+def load_all_search_terms(package: str = PACKAGE) -> dict[str, list[str]]:
     search_terms_dir = resources.files(package)
     text_files = [p for p in search_terms_dir.iterdir() if p.suffix == ".txt"]
-    all_terms = []
+    all_terms = {}
     for txt in text_files:
-        terms = read_search_terms(txt)
-        all_terms.extend(terms)
+        all_terms[Path(txt).stem] = read_search_terms(txt)
     return all_terms
 
 
@@ -30,11 +33,11 @@ def save_collected_data(data: str, csv_path: str):
 
 
 def query_arxiv_papers(terms: list[str]):
-    health_query = " OR ".join(f'"{term}"' for term in terms)
-    query = f'(artificial intelligence OR machine learning OR deep learning) AND ({health_query})'
+    health_query = " OR ".join(f'{term.lower()}' for term in terms)
+    # query = f'(artificial intelligence OR machine learning OR deep learning) AND ({health_query})'
 
     search = arxiv.Search(
-        query=query,
+        query=health_query,
         max_results=500,
         sort_by=arxiv.SortCriterion.SubmittedDate,
         sort_order=arxiv.SortOrder.Descending
@@ -60,12 +63,22 @@ def query_arxiv_papers(terms: list[str]):
 def download_papers():
     parser = argparse.ArgumentParser()
     parser.add_argument('--terms-dir', default=PACKAGE, help="The directory containing txt files with search terms.")
-    parser.add_argument('--save-file', default="ai_womens_health_arxiv_chunks.csv", help="The directory containing txt files with search terms.")
+    parser.add_argument('--save-folder', default="ai_womens_health_arxiv_chunks/", help="The directory containing txt files with search terms.")
     args = parser.parse_args()
+
+    dir = (Path(os.getcwd()) / args.save_folder)
+    dir.mkdir(exist_ok=True)
 
     all_terms = load_all_search_terms(args.terms_dir)
 
-    save_collected_data(query_arxiv_papers(all_terms), args.save_file)
+    for doc, terms in all_terms.items():
+        save_file_name = dir / f"{doc}.{SAVE_EXT}"
+        try:
+            paper_data = query_arxiv_papers(terms)
+            save_collected_data(paper_data, save_file_name)
+        except arxiv.UnexpectedEmptyPageError as e:
+            print(f"Page unexpectedly empty error for topic: {doc}.")
+    
 
 if __name__ == "__main__":
     download_papers()
