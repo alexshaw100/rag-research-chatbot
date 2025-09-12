@@ -24,7 +24,8 @@ def load_all_search_terms(package: str = PACKAGE) -> dict[str, list[str]]:
     text_files = [p for p in search_terms_dir.iterdir() if p.suffix == ".txt"]
     all_terms = {}
     for txt in text_files:
-        all_terms[Path(txt).stem] = read_search_terms(txt)
+        # read_search_terms returns a pandas Series; convert to a plain list
+        all_terms[Path(txt).stem] = list(read_search_terms(txt))
     return all_terms
 
 
@@ -40,6 +41,7 @@ def save_collected_data(data: list[dict], csv_path: str):
             keys.update(row.keys())
         preferred = [
             "paper_id",
+            "source",
             "title",
             "authors",
             "published",
@@ -89,6 +91,7 @@ def query_arxiv_papers(terms: list[str], max_results: int = 500, wrap_width: int
                 "title": result.title,
                 "authors": ", ".join(author.name for author in result.authors),
                 "published": result.published.strftime("%Y-%m-%d"),
+                "source": "arxiv",
                 "chunk_id": i,
                 "text_chunk": chunk,
                 "pdf_url": result.pdf_url
@@ -214,7 +217,7 @@ def _process_medrxiv_item(item: dict, lower_terms: list[str], wrap_width: int) -
     published = _safe_date_iso(date_str)
 
     ta_lower = (title + " " + abstract).lower()
-    if lower_terms and not any(term in ta_lower for term in lower_terms):
+    if len(lower_terms) > 0 and not any(term in ta_lower for term in lower_terms):
         return []
 
     wrapped = textwrap.wrap(abstract.replace("\n", " "), width=wrap_width)
@@ -225,6 +228,7 @@ def _process_medrxiv_item(item: dict, lower_terms: list[str], wrap_width: int) -
             "title": title,
             "authors": authors,
             "published": published,
+            "source": "medrxiv",
             "chunk_id": i,
             "text_chunk": chunk,
             "abstract": abstract,
